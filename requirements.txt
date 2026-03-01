@@ -1,0 +1,15 @@
+fastapi>=0.100.0
+uvicorn>=0.23.0
+ultralytics
+opencv-python-headless
+python-multipart
+plotly
+scikit-learn
+pika
+python-dotenv
+simplejson
+pymupdf
+torch
+torchvision
+numpy
+pillow
