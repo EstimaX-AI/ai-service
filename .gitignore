@@ -1,8 +1,16 @@
+# Model weights
+*.pt
+
+# Detection output
+app/detections/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
 
+.idea/
+.idea
 # C extensions
 *.so
 
@@ -136,6 +144,10 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+.env.dev
+.env.prod
+.env.local
 .envrc
 .venv
 env/

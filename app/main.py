@@ -1,10 +1,20 @@
-from fastapi import FastAPI
-from api.routes import router
+import logging
+import traceback
+from utils.rabbitmq_client import rabbitmq_client
 
-app = FastAPI()
-app.include_router(router)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+def main():
+    logger.info("Starting AI service")
+    try:
+        rabbitmq_client.start_consuming()
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        traceback.print_exc()
+    finally:
+        rabbitmq_client.close()
+        logger.info("AI service stopped")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    main()
