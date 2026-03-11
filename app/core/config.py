@@ -13,3 +13,6 @@ class Config:
     ai_jobs: str = os.getenv("PDF_QUEUE", "ai_jobs")
     result_queue: str = os.getenv("RESULT_QUEUE", "result_queue")
     notification_queue: str = os.getenv("NOTIFICATION_QUEUE", "notification_queue")
+
+    # Modal serverless inference
+    USE_MODAL: bool = os.getenv("USE_MODAL", "false").lower() == "true"
