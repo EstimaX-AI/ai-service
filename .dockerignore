@@ -1,0 +1,12 @@
+.git
+.gitignore
+.idea
+.venv
+__pycache__
+*.pyc
+app/detections/
+app/.env*
+!app/.env.example
+LICENSE
+README.md
+*.md

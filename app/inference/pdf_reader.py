@@ -148,14 +148,4 @@ def process_pdf_for_symbols(
     for k, v in sorted(total_counts.items()):
         print(f"{k}: {v}")
 
-    return total_counts
-
-
-# ── RUN ──
-if __name__ == "__main__":
-    PDF_FILE = "test2.png"
-    MODEL_FILE = "best_v8.pt"
-    OUTPUT_FOLDER = "detections"
-    DPI = 200
-
-    process_pdf_for_symbols(PDF_FILE, MODEL_FILE, OUTPUT_FOLDER, dpi=DPI)
+    return True,total_counts
