@@ -1,6 +1,3 @@
-# Model weights
-*.pt
-
 # Detection output
 app/detections/
 
