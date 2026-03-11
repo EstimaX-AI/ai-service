@@ -16,3 +16,5 @@ class Config:
 
     # Modal serverless inference
     USE_MODAL: bool = os.getenv("USE_MODAL", "false").lower() == "true"
+    # GPU preference: "auto" (try GPU, fallback CPU), "gpu" (GPU only), "cpu" (CPU only)
+    MODAL_GPU: str = os.getenv("MODAL_GPU", "auto").lower()

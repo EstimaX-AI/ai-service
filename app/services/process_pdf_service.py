@@ -22,55 +22,52 @@ def _download_pdf(url: str) -> str:
     return tmp.name
 
 
+def _call_modal_function(func_name: str, file_path: str, label: str, max_retries: int = 2):
+    """Call a single Modal function with retry for transient gRPC errors."""
+    import modal
+
+    logger.info(f"[Modal] Calling '{func_name}' ({label}) with file_path: {file_path}")
+    fn = modal.Function.from_name("ai-worker", func_name)
+
+    for attempt in range(1, max_retries + 1):
+        start_time = time.time()
+        try:
+            result = fn.remote(file_path)
+            elapsed = time.time() - start_time
+            logger.info(f"[Modal] {label} call completed in {elapsed:.1f}s. Status: {result.get('status')}")
+            return result["status"], result["result"]
+        except (modal.exception.ConnectionError, TimeoutError) as e:
+            elapsed = time.time() - start_time
+            if attempt < max_retries:
+                logger.warning(f"[Modal] {label} attempt {attempt}/{max_retries} failed after {elapsed:.1f}s: {str(e)}. Retrying...")
+                time.sleep(3)
+            else:
+                logger.error(f"[Modal] {label} failed after {max_retries} attempts ({elapsed:.1f}s): {str(e)}")
+                raise
+
+
 def _process_pdf_via_modal(file_path: str):
     """Offload PDF processing to Modal serverless worker.
-    Tries GPU first, falls back to CPU if GPU is unavailable.
+    Respects Config.MODAL_GPU: 'gpu', 'cpu', or 'auto' (try GPU, fallback CPU).
     """
-    import modal
-    import concurrent.futures
+    gpu_mode = Config.MODAL_GPU
+    logger.info(f"[Modal] MODAL_GPU={gpu_mode}")
 
-    start_time = time.time()
+    # --- GPU only ---
+    if gpu_mode == "gpu":
+        return _call_modal_function("process_pdf_job_gpu", file_path, "GPU")
 
-    # --- Try GPU first ---
+    # --- CPU only ---
+    if gpu_mode == "cpu":
+        return _call_modal_function("process_pdf_job_cpu", file_path, "CPU")
+
+    # --- Auto: try GPU first, fallback to CPU ---
     try:
-        logger.info(f"[Modal] Trying GPU function 'process_pdf_job_gpu' in app 'ai-worker'")
-        gpu_fn = modal.Function.from_name("ai-worker", "process_pdf_job_gpu")
-        logger.info(f"[Modal] GPU function found, calling remote with file_path: {file_path}")
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(gpu_fn.remote, file_path)
-            result = future.result(timeout=900)  # 15 minute timeout
-
-        elapsed = time.time() - start_time
-        logger.info(f"[Modal] GPU call completed in {elapsed:.1f}s. Status: {result.get('status')}")
-        return result["status"], result["result"]
-
-    except concurrent.futures.TimeoutError:
-        elapsed = time.time() - start_time
-        logger.error(f"[Modal] GPU call timed out after {elapsed:.1f}s")
+        return _call_modal_function("process_pdf_job_gpu", file_path, "GPU")
     except Exception as e:
         logger.warning(f"[Modal] GPU function failed: {str(e)}, falling back to CPU")
 
-    # --- Fallback to CPU ---
-    try:
-        logger.info(f"[Modal] Trying CPU function 'process_pdf_job_cpu' in app 'ai-worker'")
-        cpu_fn = modal.Function.from_name("ai-worker", "process_pdf_job_cpu")
-        logger.info(f"[Modal] CPU function found, calling remote with file_path: {file_path}")
-
-        start_time = time.time()  # reset timer for CPU
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(cpu_fn.remote, file_path)
-            result = future.result(timeout=900)
-
-        elapsed = time.time() - start_time
-        logger.info(f"[Modal] CPU call completed in {elapsed:.1f}s. Status: {result.get('status')}")
-        return result["status"], result["result"]
-
-    except concurrent.futures.TimeoutError:
-        elapsed = time.time() - start_time
-        raise TimeoutError(f"Modal CPU call timed out after {elapsed:.1f}s")
-    except Exception as e:
-        raise RuntimeError(f"Both GPU and CPU Modal functions failed. CPU error: {str(e)}")
+    return _call_modal_function("process_pdf_job_cpu", file_path, "CPU")
 
 
 def process_pdf(user_id: str, job_id: str, file_path: str):
