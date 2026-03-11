@@ -10,6 +10,6 @@ class Config:
     RABBITMQ_PASSWORD: str = os.getenv("MQ_PASSWORD", "guest")
     RABBIT_VHOST: str = os.getenv("MQ_VHOST", "/")
 
-    ai_jobs: str = os.getenv("PDF_QUEUE", "pdf_queue")
+    ai_jobs: str = os.getenv("PDF_QUEUE", "ai_jobs")
     result_queue: str = os.getenv("RESULT_QUEUE", "result_queue")
     notification_queue: str = os.getenv("NOTIFICATION_QUEUE", "notification_queue")
