@@ -16,6 +16,7 @@ class RabbitMQClient:
     def __init__(self):
         self._connection = None
         self._channel = None
+        self._publish_lock = threading.Lock()
 
     def _get_connection_params(self):
         ipv4_host = socket.getaddrinfo(Config.RABBIT_HOST, None, socket.AF_INET)[0][4][0]
@@ -25,12 +26,14 @@ class RabbitMQClient:
             virtual_host=Config.RABBIT_VHOST,
             credentials=pika.PlainCredentials(Config.RABBIT_USER, Config.RABBITMQ_PASSWORD),
             socket_timeout=30,
-            heartbeat=600,
-            blocked_connection_timeout=30
+            heartbeat=1800,
+            blocked_connection_timeout=300
         )
 
-    def connect(self):
+    def _connect(self):
+        """Get or create the publish connection. Caller MUST hold _publish_lock."""
         if self._connection is None or self._connection.is_closed:
+            logger.info("Creating new publish connection to RabbitMQ")
             self._connection = pika.BlockingConnection(self._get_connection_params())
             self._channel = self._connection.channel()
             self._channel.confirm_delivery()
@@ -63,18 +66,24 @@ class RabbitMQClient:
 
         for attempt in range(max_retries):
             try:
-                channel = self.connect()
-                channel.basic_publish(
-                    exchange="",
-                    routing_key=Config.result_queue,
-                    body=json.dumps(message),
-                    properties=pika.BasicProperties(delivery_mode=2)
-                )
+                with self._publish_lock:
+                    # Force reconnect if stale (e.g. after long Modal call)
+                    if self._connection and self._connection.is_closed:
+                        logger.warning("Publish connection was closed, reconnecting...")
+                        self._connection = None
+                    channel = self._connect()
+                    channel.basic_publish(
+                        exchange="",
+                        routing_key=Config.result_queue,
+                        body=json.dumps(message),
+                        properties=pika.BasicProperties(delivery_mode=2)
+                    )
                 logger.info(f"Published to result queue: {job_id}")
                 return True
             except Exception as e:
-                logger.error(f"Failed to publish to result queue: {str(e)}")
-                self._connection = None
+                logger.error(f"Failed to publish to result queue (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                with self._publish_lock:
+                    self._connection = None
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
                 else:
@@ -85,24 +94,29 @@ class RabbitMQClient:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                channel = self.connect()
-                channel.basic_publish(
-                    exchange="",
-                    routing_key=Config.notification_queue,
-                    body=json.dumps({
-                        "user_id": user_id,
-                        "job_id": job_id,
-                        "message": message,
-                        "status": status,
-                        "created_at": datetime.now().isoformat()
-                    }),
-                    properties=pika.BasicProperties(delivery_mode=2)
-                )
+                with self._publish_lock:
+                    if self._connection and self._connection.is_closed:
+                        logger.warning("Publish connection was closed, reconnecting...")
+                        self._connection = None
+                    channel = self._connect()
+                    channel.basic_publish(
+                        exchange="",
+                        routing_key=Config.notification_queue,
+                        body=json.dumps({
+                            "user_id": user_id,
+                            "job_id": job_id,
+                            "message": message,
+                            "status": status,
+                            "created_at": datetime.now().isoformat()
+                        }),
+                        properties=pika.BasicProperties(delivery_mode=2)
+                    )
                 logger.info(f"Published to notification queue: {job_id}")
                 return True
             except Exception as e:
-                logger.error(f"Failed to publish to notification queue: {str(e)}")
-                self._connection = None
+                logger.error(f"Failed to publish to notification queue (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                with self._publish_lock:
+                    self._connection = None
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
                 else:
@@ -146,26 +160,39 @@ class RabbitMQClient:
                 consume_channel.basic_qos(prefetch_count=1)
 
                 def callback(ch, method, properties, body):
-                    logger.info(f"Received message for job: {json.loads(body).get('job_id')}")
+                    job_id = json.loads(body).get('job_id', 'unknown')
+                    logger.info(f"Received message for job: {job_id}")
 
                     def process():
+                        delivery_tag = method.delivery_tag
                         try:
                             success = self.process_message(body)
                             if success:
-                                consume_connection.add_callback_threadsafe(
-                                    lambda: ch.basic_ack(delivery_tag=method.delivery_tag)
-                                )
+                                logger.info(f"Job {job_id} processed successfully, sending ACK")
+                                try:
+                                    consume_connection.add_callback_threadsafe(
+                                        lambda: ch.basic_ack(delivery_tag=delivery_tag)
+                                    )
+                                except Exception as ack_err:
+                                    logger.error(f"Failed to ACK job {job_id}: {str(ack_err)}")
                             else:
-                                consume_connection.add_callback_threadsafe(
-                                    lambda: ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-                                )
+                                logger.warning(f"Job {job_id} processing failed, sending NACK")
+                                try:
+                                    consume_connection.add_callback_threadsafe(
+                                        lambda: ch.basic_nack(delivery_tag=delivery_tag, requeue=False)
+                                    )
+                                except Exception as nack_err:
+                                    logger.error(f"Failed to NACK job {job_id}: {str(nack_err)}")
                         except Exception as e:
-                            logger.error(f"Error processing message: {str(e)}")
-                            consume_connection.add_callback_threadsafe(
-                                lambda: ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-                            )
+                            logger.error(f"Error processing message for job {job_id}: {str(e)}", exc_info=True)
+                            try:
+                                consume_connection.add_callback_threadsafe(
+                                    lambda: ch.basic_nack(delivery_tag=delivery_tag, requeue=False)
+                                )
+                            except Exception as nack_err:
+                                logger.error(f"Failed to NACK job {job_id} after error: {str(nack_err)}")
 
-                    thread = threading.Thread(target=process, daemon=True)
+                    thread = threading.Thread(target=process, daemon=True, name=f"job-{job_id}")
                     thread.start()
 
                 consume_channel.basic_consume(

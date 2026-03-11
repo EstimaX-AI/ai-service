@@ -8,11 +8,35 @@ Test run: modal run modal_worker.py
 import modal
 
 # ---------------------------------------------------------------------------
-# Modal App & Image
+# Modal App & Images
 # ---------------------------------------------------------------------------
 app = modal.App("ai-worker")
 
-image = (
+# Shared dependencies (everything except torch)
+_common_packages = [
+    "ultralytics",
+    "opencv-python-headless",
+    "pymupdf",
+    "numpy",
+    "pillow",
+    "requests",
+]
+
+# GPU image: installs CUDA-enabled torch
+gpu_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("libgl1", "libglib2.0-0")
+    .pip_install("torch", "torchvision")  # defaults to CUDA build
+    .pip_install(*_common_packages)
+    .add_local_file(
+        "app/models/best.pt",
+        remote_path="/root/models/best.pt",
+        copy=True,
+    )
+)
+
+# CPU image: installs CPU-only torch (smaller, faster cold-start)
+cpu_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("libgl1", "libglib2.0-0")
     .pip_install(
@@ -20,14 +44,7 @@ image = (
         "torchvision",
         extra_options="--index-url https://download.pytorch.org/whl/cpu",
     )
-    .pip_install(
-        "ultralytics",
-        "opencv-python-headless",
-        "pymupdf",
-        "numpy",
-        "pillow",
-        "requests",
-    )
+    .pip_install(*_common_packages)
     .add_local_file(
         "app/models/best.pt",
         remote_path="/root/models/best.pt",
@@ -37,16 +54,11 @@ image = (
 
 
 # ---------------------------------------------------------------------------
-# Inference helpers (mirrors app/inference/pdf_reader.py)
+# Shared processing logic
 # ---------------------------------------------------------------------------
-@app.function(
-    image=image,
-    timeout=3600,
-    gpu="T4",  # Uncomment to enable GPU inference
-)
-def process_pdf_job(file_path: str) -> dict:
+def _process_pdf(file_path: str) -> dict:
     """
-    Process a PDF for symbol detection.
+    Core PDF processing logic shared by GPU and CPU functions.
 
     Args:
         file_path: URL (http/https) or absolute local path to the PDF.
@@ -65,15 +77,22 @@ def process_pdf_job(file_path: str) -> dict:
     import pymupdf as fitz
     from PIL import Image
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[Modal Worker] Using device: {device}")
+
     MODEL_PATH = "/root/models/best.pt"
     model = YOLO(MODEL_PATH)
+    if device == "cuda":
+        model.to("cuda")
 
     # ------------------------------------------------------------------
     # Download PDF if URL
     # ------------------------------------------------------------------
     tmp_path = None
+    print(f"[Modal Worker] Starting PDF processing for: {file_path}")
     try:
         if file_path.startswith("http://") or file_path.startswith("https://"):
+            print(f"[Modal Worker] Downloading PDF from URL...")
             resp = req.get(file_path, timeout=60)
             resp.raise_for_status()
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
@@ -81,8 +100,10 @@ def process_pdf_job(file_path: str) -> dict:
             tmp.close()
             tmp_path = tmp.name
             local_path = tmp_path
+            print(f"[Modal Worker] PDF downloaded: {len(resp.content)} bytes -> {tmp_path}")
         else:
             local_path = file_path
+            print(f"[Modal Worker] Using local file: {local_path}")
 
         # ------------------------------------------------------------------
         # Sliding-window detection (same logic as pdf_reader.py)
@@ -147,6 +168,7 @@ def process_pdf_job(file_path: str) -> dict:
         doc = fitz.open(local_path)
         total_counts = {}
         dpi = 200
+        print(f"[Modal Worker] PDF opened: {len(doc)} pages, dpi={dpi}")
 
         for page_idx in range(len(doc)):
             page = doc[page_idx]
@@ -160,22 +182,46 @@ def process_pdf_job(file_path: str) -> dict:
                 img_np = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB)
             img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
+            print(f"[Modal Worker] Processing page {page_idx + 1}/{len(doc)} (size: {pix.w}x{pix.h})...")
             page_counts = detect_symbols_in_image(model, img_np)
             for k, v in page_counts.items():
                 total_counts[k] = total_counts.get(k, 0) + v
 
-            print(f"Page {page_idx + 1} counts: {page_counts}")
+            print(f"[Modal Worker] Page {page_idx + 1} counts: {page_counts}")
 
         doc.close()
 
-        print("\nFinal total counts:")
+        print(f"[Modal Worker] Processing complete on {device}.")
+        print(f"[Modal Worker] Final total counts:")
         for k, v in sorted(total_counts.items()):
             print(f"  {k}: {v}")
 
         return {"status": "success", "result": total_counts}
 
     except Exception as e:
+        print(f"[Modal Worker] ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {"status": "error", "result": {"error": str(e)}}
     finally:
         if tmp_path and os.path.exists(tmp_path):
+            print(f"[Modal Worker] Cleaning up temp file: {tmp_path}")
             os.remove(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# GPU function (preferred — faster inference)
+# ---------------------------------------------------------------------------
+@app.function(image=gpu_image, timeout=3600, gpu="T4")
+def process_pdf_job_gpu(file_path: str) -> dict:
+    print("[Modal Worker] Running on GPU function (T4)")
+    return _process_pdf(file_path)
+
+
+# ---------------------------------------------------------------------------
+# CPU function (fallback — no GPU needed, faster cold-start)
+# ---------------------------------------------------------------------------
+@app.function(image=cpu_image, timeout=3600)
+def process_pdf_job_cpu(file_path: str) -> dict:
+    print("[Modal Worker] Running on CPU function (fallback)")
+    return _process_pdf(file_path)
